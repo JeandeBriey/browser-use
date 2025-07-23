@@ -25,6 +25,7 @@ from browser_use.llm.messages import (
 	ContentPartTextParam as ContentText,
 )
 from browser_use.llm.openai.chat import ChatOpenAI
+from browser_use.llm.ollama.chat import ChatOllama
 
 # Make better names for the message
 
@@ -45,4 +46,5 @@ __all__ = [
 	'ChatAnthropic',
 	'ChatGroq',
 	'ChatAzureOpenAI',
+	'ChatOllama',
 ]

@@ -588,52 +588,105 @@ Explain the content of the page and that the requested information is not availa
 			return ActionResult(extracted_content=msg, include_in_memory=True, long_term_memory=f'Sent keys: {params.keys}')
 
 		@self.registry.action(
-			description='If you dont find something which you want to interact with, scroll to it',
+			description='If you dont find something which you want to interact with, scroll to it (works also in modal/popup windows)',
 		)
 		async def scroll_to_text(text: str, page: Page):  # type: ignore
 			try:
-				# Try different locator strategies
 				locators = [
 					page.get_by_text(text, exact=False),
 					page.locator(f'text={text}'),
-					page.locator(f"//*[contains(text(), '{text}')]"),
+					page.locator(f"//*[contains(text(), '{text}')]")
 				]
-
 				for locator in locators:
 					try:
-						if await locator.count() == 0:
+						count = await locator.count()
+						if count == 0:
 							continue
-
-						element = locator.first
-						is_visible = await element.is_visible()
-						bbox = await element.bounding_box()
-
-						if is_visible and bbox is not None and bbox['width'] > 0 and bbox['height'] > 0:
-							await element.scroll_into_view_if_needed()
-							await asyncio.sleep(0.5)  # Wait for scroll to complete
-							msg = f'🔍  Scrolled to text: {text}'
-							logger.info(msg)
-							return ActionResult(
-								extracted_content=msg, include_in_memory=True, long_term_memory=f'Scrolled to text: {text}'
-							)
-
+						for i in range(count):
+							element = locator.nth(i)
+							is_visible = await element.is_visible()
+							bbox = await element.bounding_box()
+							if is_visible and bbox is not None and bbox['width'] > 0 and bbox['height'] > 0:
+								# Remonter la chaîne des parents pour trouver un conteneur scrollable
+								parent = await element.evaluate_handle("""
+									(child) => {
+										let node = child.parentElement;
+										while (node) {
+											const style = window.getComputedStyle(node);
+											const overflowY = style.overflowY;
+											if (
+												(node.scrollHeight > node.clientHeight) &&
+												(overflowY === 'auto' || overflowY === 'scroll' || overflowY === 'overlay')
+											) {
+												return node;
+											}
+											node = node.parentElement;
+										}
+										return null;
+									}
+								""")
+								if parent:
+									await parent.evaluate(
+										'(node, child) => {'
+										'  if (!child) return;'
+										'  const childRect = child.getBoundingClientRect();'
+										'  const nodeRect = node.getBoundingClientRect();'
+										'  if (childRect.top < nodeRect.top || childRect.bottom > nodeRect.bottom) {'
+										'    node.scrollTop += (childRect.top - nodeRect.top);'
+										'  }'
+										'}',
+										element
+									)
+									await asyncio.sleep(0.5)
+									msg = f'🔍  Scrolled scrollable parent to text: {text}'
+									logger.info(msg)
+									return ActionResult(
+										extracted_content=msg, include_in_memory=True, long_term_memory=f'Scrolled scrollable parent to text: {text}'
+									)
+								else:
+									# Fallback: scroll element into view (main page)
+									await element.scroll_into_view_if_needed()
+									await asyncio.sleep(0.5)
+									msg = f'🔍  Scrolled to text: {text} (fallback scrollIntoView)'
+									logger.info(msg)
+									return ActionResult(
+										extracted_content=msg, include_in_memory=True, long_term_memory=f'Scrolled to text: {text} (fallback)'
+									)
 					except Exception as e:
 						logger.debug(f'Locator attempt failed: {str(e)}')
 						continue
-
-				msg = f"Text '{text}' not found or not visible on page"
+				# Fallback: try to scroll to input fields with placeholder or label matching text
+				input_selectors = [
+					f'input[placeholder*="{text}"]',
+					f'label:has-text("{text}")',
+					f'input',
+				]
+				for sel in input_selectors:
+					try:
+						inputs = await page.query_selector_all(sel)
+						for inp in inputs:
+							await inp.evaluate('node => node.scrollIntoView({block: "center"})')
+							msg = f'🔍  Scrolled to input or label matching: {text}'
+							logger.info(msg)
+							return ActionResult(
+								extracted_content=msg,
+								include_in_memory=True,
+								long_term_memory=f'Scrolled to input or label matching: {text}'
+							)
+					except Exception:
+						continue
+				msg = f"Text '{text}' not found or not visible on page or in scrollable containers"
 				logger.info(msg)
 				return ActionResult(
 					extracted_content=msg,
 					include_in_memory=True,
 					long_term_memory=f"Tried scrolling to text '{text}' but it was not found",
 				)
-
 			except Exception as e:
 				msg = f"Failed to scroll to text '{text}': {str(e)}"
 				logger.error(msg)
 				return ActionResult(error=msg, include_in_memory=True)
-
+		
 		# File System Actions
 		@self.registry.action('Write content to file_name in file system, use only .md or .txt extensions.')
 		async def write_file(file_name: str, content: str, file_system: FileSystem):
