@@ -628,7 +628,7 @@ Explain the content of the page and that the requested information is not availa
 			return ActionResult(extracted_content=msg, include_in_memory=True, long_term_memory=f'Sent keys: {params.keys}')
 
 		@self.registry.action(
-			description='If you dont find something which you want to interact with, scroll to it',
+			description='Scroll to a text in the current page (works also in modal/popup windows)',
 		)
 		async def scroll_to_text(text: str, page: Page):  # type: ignore
 			try:
