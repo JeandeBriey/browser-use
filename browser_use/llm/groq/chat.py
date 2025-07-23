@@ -3,7 +3,6 @@ from dataclasses import dataclass
 from typing import Literal, TypeVar, overload
 
 from groq import (
-	DEFAULT_MAX_RETRIES,
 	APIError,
 	APIResponseValidationError,
 	APIStatusError,
@@ -12,7 +11,7 @@ from groq import (
 	RateLimitError,
 	Timeout,
 )
-from groq.types.chat import ChatCompletion
+from groq.types.chat import ChatCompletion, ChatCompletionToolChoiceOptionParam, ChatCompletionToolParam
 from groq.types.chat.completion_create_params import (
 	ResponseFormatResponseFormatJsonSchema,
 	ResponseFormatResponseFormatJsonSchemaJsonSchema,
@@ -25,10 +24,23 @@ from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
 from browser_use.llm.groq.parser import try_parse_groq_failed_generation
 from browser_use.llm.groq.serializer import GroqMessageSerializer
 from browser_use.llm.messages import BaseMessage
+from browser_use.llm.schema import SchemaOptimizer
 from browser_use.llm.views import ChatInvokeUsage
 
 GroqVerifiedModels = Literal[
-	'meta-llama/llama-4-maverick-17b-128e-instruct', 'meta-llama/llama-4-scout-17b-16e-instruct', 'qwen/qwen3-32b'
+	'meta-llama/llama-4-maverick-17b-128e-instruct',
+	'meta-llama/llama-4-scout-17b-16e-instruct',
+	'qwen/qwen3-32b',
+	'moonshotai/kimi-k2-instruct',
+]
+
+JsonSchemaModels = [
+	'meta-llama/llama-4-maverick-17b-128e-instruct',
+	'meta-llama/llama-4-scout-17b-16e-instruct',
+]
+
+ToolCallingModels = [
+	'moonshotai/kimi-k2-instruct',
 ]
 
 T = TypeVar('T', bound=BaseModel)
@@ -47,12 +59,13 @@ class ChatGroq(BaseChatModel):
 
 	# Model params
 	temperature: float | None = None
+	service_tier: Literal['auto', 'on_demand', 'flex'] | None = None
 
 	# Client initialization parameters
 	api_key: str | None = None
 	base_url: str | URL | None = None
 	timeout: float | Timeout | NotGiven | None = None
-	max_retries: int = DEFAULT_MAX_RETRIES
+	max_retries: int = 10  # Increase default retries for automation reliability
 
 	def get_client(self) -> AsyncGroq:
 		return AsyncGroq(api_key=self.api_key, base_url=self.base_url, timeout=self.timeout, max_retries=self.max_retries)
@@ -71,6 +84,9 @@ class ChatGroq(BaseChatModel):
 				prompt_tokens=response.usage.prompt_tokens,
 				completion_tokens=response.usage.completion_tokens,
 				total_tokens=response.usage.total_tokens,
+				prompt_cached_tokens=None,  # Groq doesn't support cached tokens
+				prompt_cache_creation_tokens=None,
+				prompt_image_tokens=None,
 			)
 			if response.usage is not None
 			else None
@@ -90,50 +106,9 @@ class ChatGroq(BaseChatModel):
 
 		try:
 			if output_format is None:
-				chat_completion = await self.get_client().chat.completions.create(
-					messages=groq_messages,
-					model=self.model,
-					temperature=self.temperature,
-				)
-				usage = self._get_usage(chat_completion)
-				return ChatInvokeCompletion(
-					completion=chat_completion.choices[0].message.content or '',
-					usage=usage,
-				)
-
+				return await self._invoke_regular_completion(groq_messages)
 			else:
-				schema = output_format.model_json_schema()
-				schema['additionalProperties'] = False
-
-				# Return structured response
-				response = await self.get_client().chat.completions.create(
-					model=self.model,
-					messages=groq_messages,
-					temperature=self.temperature,
-					response_format=ResponseFormatResponseFormatJsonSchema(
-						json_schema=ResponseFormatResponseFormatJsonSchemaJsonSchema(
-							name=output_format.__name__,
-							description='Model output schema',
-							schema=schema,
-						),
-						type='json_schema',
-					),
-				)
-
-				if not response.choices[0].message.content:
-					raise ModelProviderError(
-						message='No content in response',
-						status_code=500,
-						model=self.name,
-					)
-
-				parsed_response = output_format.model_validate_json(response.choices[0].message.content)
-
-				usage = self._get_usage(response)
-				return ChatInvokeCompletion(
-					completion=parsed_response,
-					usage=usage,
-				)
+				return await self._invoke_structured_output(groq_messages, output_format)
 
 		except RateLimitError as e:
 			raise ModelRateLimitError(message=e.response.text, status_code=e.response.status_code, model=self.name) from e
@@ -164,3 +139,79 @@ class ChatGroq(BaseChatModel):
 			raise ModelProviderError(message=e.message, model=self.name) from e
 		except Exception as e:
 			raise ModelProviderError(message=str(e), model=self.name) from e
+
+	async def _invoke_regular_completion(self, groq_messages) -> ChatInvokeCompletion[str]:
+		"""Handle regular completion without structured output."""
+		chat_completion = await self.get_client().chat.completions.create(
+			messages=groq_messages,
+			model=self.model,
+			temperature=self.temperature,
+			service_tier=self.service_tier,
+		)
+		usage = self._get_usage(chat_completion)
+		return ChatInvokeCompletion(
+			completion=chat_completion.choices[0].message.content or '',
+			usage=usage,
+		)
+
+	async def _invoke_structured_output(self, groq_messages, output_format: type[T]) -> ChatInvokeCompletion[T]:
+		"""Handle structured output using either tool calling or JSON schema."""
+		schema = SchemaOptimizer.create_optimized_json_schema(output_format)
+
+		if self.model in ToolCallingModels:
+			response = await self._invoke_with_tool_calling(groq_messages, output_format, schema)
+		else:
+			response = await self._invoke_with_json_schema(groq_messages, output_format, schema)
+
+		if not response.choices[0].message.content:
+			raise ModelProviderError(
+				message='No content in response',
+				status_code=500,
+				model=self.name,
+			)
+
+		parsed_response = output_format.model_validate_json(response.choices[0].message.content)
+		usage = self._get_usage(response)
+
+		return ChatInvokeCompletion(
+			completion=parsed_response,
+			usage=usage,
+		)
+
+	async def _invoke_with_tool_calling(self, groq_messages, output_format: type[T], schema) -> ChatCompletion:
+		"""Handle structured output using tool calling."""
+		tool = ChatCompletionToolParam(
+			function={
+				'name': output_format.__name__,
+				'description': f'Extract information in the format of {output_format.__name__}',
+				'parameters': schema,
+			},
+			type='function',
+		)
+		tool_choice: ChatCompletionToolChoiceOptionParam = 'required'
+
+		return await self.get_client().chat.completions.create(
+			model=self.model,
+			messages=groq_messages,
+			temperature=self.temperature,
+			tools=[tool],
+			tool_choice=tool_choice,
+			service_tier=self.service_tier,
+		)
+
+	async def _invoke_with_json_schema(self, groq_messages, output_format: type[T], schema) -> ChatCompletion:
+		"""Handle structured output using JSON schema."""
+		return await self.get_client().chat.completions.create(
+			model=self.model,
+			messages=groq_messages,
+			temperature=self.temperature,
+			response_format=ResponseFormatResponseFormatJsonSchema(
+				json_schema=ResponseFormatResponseFormatJsonSchemaJsonSchema(
+					name=output_format.__name__,
+					description='Model output schema',
+					schema=schema,
+				),
+				type='json_schema',
+			),
+			service_tier=self.service_tier,
+		)
